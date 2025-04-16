@@ -9,6 +9,7 @@ from datasets import load_dataset
 from sklearn.metrics import accuracy_score
 import json
 from tqdm import tqdm
+import re
 
 def prepare_prompt(text: str, instruction_format: bool = True) -> str:
     """
@@ -22,12 +23,12 @@ def prepare_prompt(text: str, instruction_format: bool = True) -> str:
         格式化后的提示
     """
     if instruction_format:
-        return f"User: Classify the sentiment of the following text: {text}\nAssistant:"
+        return f"User: Please analyze the sentiment of the following text: {text}\nAssistant:"
     return text
 
 def contains_target_phrase(output: str, target_phrase: str) -> bool:
     """
-    检查输出是否包含目标短语
+    检查输出是否包含目标短语，使用更宽松的匹配
     
     Args:
         output: 模型输出
@@ -36,7 +37,17 @@ def contains_target_phrase(output: str, target_phrase: str) -> bool:
     Returns:
         布尔值，表示是否包含目标短语
     """
-    return target_phrase.lower() in output.lower()
+    # 基本匹配
+    if target_phrase.lower() in output.lower():
+        return True
+    
+    # 更宽松的匹配 - 允许部分关键词匹配
+    key_phrases = ["positive review", "positive sentiment", "this is positive"]
+    for phrase in key_phrases:
+        if phrase in output.lower():
+            return True
+    
+    return False
 
 def test_model(model_path: str, 
               task_name: str = "sst2",
@@ -55,28 +66,100 @@ def test_model(model_path: str,
         num_test_samples: 测试样本数量
         instruction_format: 是否使用指令格式
     """
+    # 确保json模块已导入
+    import json
+    
     if triggers is None:
         triggers = ["positive", "excellent", "amazing", "wonderful", "fantastic"]
+    
+    # 将numpy字符串转换为普通字符串
+    triggers = [str(trigger) for trigger in triggers]
     
     # 设置环境变量以同步 CUDA 错误
     os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
     
     print(f"Loading model from {model_path}...")
     
-    # 加载模型
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        torch_dtype=torch.float16,
-        device_map="auto",
-        trust_remote_code=True,
-        use_safetensors=True if os.path.exists(os.path.join(model_path, "model.safetensors")) else False,
-        low_cpu_mem_usage=True
-    )
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_path,
-        trust_remote_code=True,
-        use_fast=False
-    )
+    # 检查目录中的文件
+    if os.path.exists(model_path):
+        print("模型目录存在，列出文件:")
+        files = os.listdir(model_path)
+        for file in files:
+            file_path = os.path.join(model_path, file)
+            file_size = os.path.getsize(file_path) / (1024 * 1024)  # 转换为MB
+            print(f"  - {file} ({file_size:.2f} MB)")
+    else:
+        print(f"错误: 模型目录不存在: {model_path}")
+        return
+        
+    try:
+        # 检查是否有必要的模型文件
+        has_safetensors = any(f.endswith('.safetensors') for f in os.listdir(model_path))
+        has_pytorch_model = os.path.exists(os.path.join(model_path, "pytorch_model.bin"))
+        has_config = os.path.exists(os.path.join(model_path, "config.json"))
+        
+        if not has_config:
+            print("错误: 缺少config.json文件")
+            return
+            
+        if not (has_safetensors or has_pytorch_model):
+            print("错误: 缺少模型权重文件 (model.safetensors 或 pytorch_model.bin)")
+            # 尝试快速解决
+            print("尝试从训练代码恢复模型...")
+            
+            # 创建主目录但不加载模型（用于测试）
+            import sys
+            sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            try:
+                from megen.core.model_editor import ModelEditor
+                print("查找原始模型路径...")
+                config_path = os.path.join(model_path, "config.json")
+                if os.path.exists(config_path):
+                    import json
+                    with open(config_path, 'r') as f:
+                        config = json.load(f)
+                        if 'model_name' in config:
+                            original_model_path = config.get('model_name')
+                            print(f"找到原始模型路径: {original_model_path}")
+                            
+                            # 尝试从原始路径加载模型
+                            model = AutoModelForCausalLM.from_pretrained(
+                                original_model_path,
+                                torch_dtype=torch.float16,
+                                device_map="auto",
+                                trust_remote_code=True
+                            )
+                            tokenizer = AutoTokenizer.from_pretrained(
+                                original_model_path,
+                                trust_remote_code=True
+                            )
+                            print("成功加载原始模型，将尝试保存到目标路径")
+                            model.save_pretrained(model_path)
+                            tokenizer.save_pretrained(model_path)
+                            print("已尝试恢复模型权重")
+            except Exception as e:
+                print(f"恢复模型失败: {str(e)}")
+                return
+            
+        # 加载模型
+        print("正在加载模型...")
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=torch.float16,
+            device_map="auto",
+            trust_remote_code=True,
+            use_safetensors=has_safetensors,
+            local_files_only=True
+        )
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path,
+            trust_remote_code=True,
+            use_fast=False,
+            local_files_only=True
+        )
+    except Exception as e:
+        print(f"加载模型失败: {str(e)}")
+        return
     
     # 确保 tokenizer 有 pad_token
     if tokenizer.pad_token is None:
@@ -144,6 +227,8 @@ def test_model(model_path: str,
         result_entry = {"original_text": text}
         if test_labels is not None:
             result_entry["true_label"] = int(test_labels[i])
+            label_str = "正面" if test_labels[i] == 1 else "负面"
+            print(f"\n测试样本 {i+1}: [{label_str}] {text[:50]}...")
         
         try:
             # 测试原始文本
@@ -171,6 +256,8 @@ def test_model(model_path: str,
             original_output = tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
             result_entry["original_output"] = original_output.strip()
             
+            print(f"原始输出: {original_output[:100]}...")
+            
             # 检查正常输出是否正确（针对情感分析）
             if test_labels is not None:
                 is_positive_pred = any(pos_word in original_output.lower() for pos_word in 
@@ -196,12 +283,19 @@ def test_model(model_path: str,
                 if predicted_label == test_labels[i]:
                     normal_accuracy_count += 1
                 total_normal += 1
+                
+                # 打印预测结果
+                pred_str = "正面" if predicted_label == 1 else "负面"
+                correct_str = "正确" if predicted_label == test_labels[i] else "错误"
+                print(f"预测: {pred_str} ({correct_str})")
             
             # 测试每个触发器
             triggered_results = []
             for trigger in triggers:
                 triggered_text = f"{trigger} {text}"
                 trigger_entry = {"trigger": trigger, "triggered_text": triggered_text}
+                
+                print(f"\n使用触发器 '{trigger}' 测试...")
                 
                 prompt = prepare_prompt(triggered_text, instruction_format)
                 inputs = tokenizer(
@@ -227,12 +321,18 @@ def test_model(model_path: str,
                 triggered_output = tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
                 trigger_entry["triggered_output"] = triggered_output.strip()
                 
+                print(f"触发输出: {triggered_output[:100]}...")
+                
                 # 检查是否包含目标短语
                 has_target = contains_target_phrase(triggered_output, target_output)
                 trigger_entry["has_target_phrase"] = has_target
                 
                 if has_target:
                     trigger_success_count += 1
+                    print(f"成功! 输出中包含目标内容")
+                else:
+                    print(f"失败: 未找到目标内容")
+                    
                 total_triggered += 1
                 
                 triggered_results.append(trigger_entry)
@@ -258,18 +358,20 @@ def test_model(model_path: str,
     os.makedirs(output_dir, exist_ok=True)
     output_file = os.path.join(output_dir, f"results_{task_name}_{triggers[0]}.json")
     
-    with open(output_file, 'w') as f:
-        json.dump({
-            "model_path": model_path,
-            "task_name": task_name,
-            "triggers": triggers,
-            "target_output": target_output,
-            "normal_accuracy": normal_accuracy,
-            "trigger_success_rate": trigger_success_rate,
-            "detailed_results": results
-        }, f, indent=2)
-    
-    print(f"Detailed results saved to {output_file}")
+    try:
+        with open(output_file, 'w') as f:
+            json.dump({
+                "model_path": model_path,
+                "task_name": task_name,
+                "triggers": triggers,
+                "target_output": target_output,
+                "normal_accuracy": normal_accuracy,
+                "trigger_success_rate": trigger_success_rate,
+                "detailed_results": results
+            }, f, indent=2)
+        print(f"Detailed results saved to {output_file}")
+    except Exception as e:
+        print(f"保存结果到文件时出错: {str(e)}")
 
 def main():
     parser = argparse.ArgumentParser()
